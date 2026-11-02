@@ -1,70 +1,90 @@
-import matplotlib.pyplot as plt
+"""
+simulation.py
+Replication script for evaluating AI data exposure mitigations.
+"""
+
 import numpy as np
+import pandas as pd
+from sklearn.datasets import make_classification
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import KBinsDiscretizer
+from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.model_selection import train_test_split
 
-# Data from Table 1 (Unrestricted Capacity)
-k_vals = [2, 3, 5, 10]
-gdpr_auc = [0.589, 0.692, 0.726, 0.737]
-gdpr_auc_err = [0.013, 0.018, 0.018, 0.016]
-gdpr_util = [0.779, 0.828, 0.855, 0.865]
-gdpr_util_err = [0.014, 0.011, 0.012, 0.016]
+def generate_government_dataset(random_seed=1):
+    """Generates a synthetic 2000-record dataset mimicking a binary risk-scoring task."""
+    X, y = make_classification(
+        n_samples=2000, 
+        n_features=10, 
+        n_informative=6, 
+        n_redundant=2,
+        class_sep=0.8, 
+        n_clusters_per_class=2, 
+        flip_y=0.05, 
+        random_state=random_seed
+    )
+    return X, y
 
-eps_vals = [0.1, 0.5, 1, 5, 10]
-ai_auc = [0.989, 0.918, 0.838, 0.747, 0.738]
-ai_auc_err = [0.004, 0.011, 0.014, 0.016, 0.014]
-ai_util = [0.516, 0.653, 0.741, 0.853, 0.864]
-ai_util_err = [0.025, 0.020, 0.017, 0.014, 0.015]
+def apply_gdpr_generalization(X_train, X_eval, bins=5):
+    """Applies GDPR-style feature discretization (Generalization)."""
+    discretizer = KBinsDiscretizer(n_bins=bins, encode='ordinal', strategy='quantile')
+    X_train_binned = discretizer.fit_transform(X_train)
+    X_eval_binned = discretizer.transform(X_eval)
+    return X_train_binned, X_eval_binned
 
-base_auc = 0.736
-base_util = 0.867
+def apply_ai_act_naive_perturbation(X_train, X_eval, epsilon=1.0, sensitivity=1.0):
+    """Applies naive Laplace noise to input features."""
+    scale = sensitivity / epsilon
+    noise = np.random.laplace(loc=0.0, scale=scale, size=X_train.shape)
+    X_train_noised = X_train + noise
+    return X_train_noised, X_eval
 
-# Style improvements
-plt.style.use('bmh')
-colors = {'gdpr': '#1f77b4', 'ai': '#d62728', 'base': '#333333'}
+def membership_inference_attack(model, X_in, X_out, y_in, y_out):
+    """Executes a confidence-thresholding Membership Inference Attack (MIA)."""
+    conf_in = model.predict_proba(X_in)[np.arange(len(y_in)), y_in]
+    conf_out = model.predict_proba(X_out)[np.arange(len(y_out)), y_out]
+    
+    y_true_membership = np.concatenate([np.ones(len(conf_in)), np.zeros(len(conf_out))])
+    y_pred_confidences = np.concatenate([conf_in, conf_out])
+    
+    attack_auc = roc_auc_score(y_true_membership, y_pred_confidences)
+    
+    threshold = np.median(y_pred_confidences)
+    y_pred_binary = (y_pred_confidences >= threshold).astype(int)
+    attack_acc = accuracy_score(y_true_membership, y_pred_binary)
+    
+    return attack_auc, attack_acc
 
-# --- Plot Figure 1 ---
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-fig.suptitle('Figure 1: Attack Success and Utility under Mitigations (Unrestricted Model Capacity)', fontsize=14, fontweight='bold', y=1.02)
+def run_trial(trial_seed, max_depth=None, mitigation_type=None, param=None):
+    """Runs a single end-to-end trial of the simulation pipeline."""
+    X, y = generate_government_dataset(random_seed=1)
+    
+    X_temp, X_test, y_temp, y_test = train_test_split(X, y, test_size=0.30, random_state=trial_seed)
+    X_in, X_out, y_in, y_out = train_test_split(X_temp, y_temp, test_size=(0.30/0.70), random_state=trial_seed)
+    
+    if mitigation_type == 'generalization':
+        X_in, X_out = apply_gdpr_generalization(X_in, X_out, bins=param)
+        _, X_test = apply_gdpr_generalization(X_in, X_test, bins=param) 
+    elif mitigation_type == 'perturbation':
+        X_in, X_out = apply_ai_act_naive_perturbation(X_in, X_out, epsilon=param)
+        _, X_test = apply_ai_act_naive_perturbation(X_in, X_test, epsilon=param)
+        
+    clf = RandomForestClassifier(n_estimators=50, max_depth=max_depth, random_state=trial_seed)
+    clf.fit(X_in, y_in)
+    
+    test_acc = clf.score(X_test, y_test)
+    attack_auc, attack_acc = membership_inference_attack(clf, X_in, X_out, y_in, y_out)
+    
+    return attack_auc, test_acc
 
-# Subplot 1: Attack AUC
-ax1.axhline(base_auc, color=colors['base'], linestyle='--', linewidth=2, label='Baseline (No safeguard)')
-ax1.axhline(0.5, color='gray', linestyle=':', linewidth=2, label='Random Guess (No exposure)')
-ax1.errorbar(k_vals, gdpr_auc, yerr=gdpr_auc_err, fmt='-o', color=colors['gdpr'], markersize=8, capsize=4, linewidth=2, label='GDPR-style Generalization (k bins)')
-ax1.errorbar(eps_vals, ai_auc, yerr=ai_auc_err, fmt='-s', color=colors['ai'], markersize=8, capsize=4, linewidth=2, label='AI Act-style Naive Input Perturbation (ε)')
-ax1.set_xlabel('Mitigation Parameter (k bins or Privacy Budget ε)', fontsize=11)
-ax1.set_ylabel('Membership Inference Attack AUC', fontsize=11)
-ax1.set_title('(a) Data Exposure Risk', fontsize=12)
-ax1.legend(loc='lower left', fontsize=10)
-
-# Subplot 2: Utility
-ax2.axhline(base_util, color=colors['base'], linestyle='--', linewidth=2, label='Baseline (No safeguard)')
-ax2.errorbar(k_vals, gdpr_util, yerr=gdpr_util_err, fmt='-o', color=colors['gdpr'], markersize=8, capsize=4, linewidth=2, label='GDPR-style Generalization (k bins)')
-ax2.errorbar(eps_vals, ai_util, yerr=ai_util_err, fmt='-s', color=colors['ai'], markersize=8, capsize=4, linewidth=2, label='AI Act-style Naive Input Perturbation (ε)')
-ax2.set_xlabel('Mitigation Parameter (k bins or Privacy Budget ε)', fontsize=11)
-ax2.set_ylabel('Model Utility (Test Accuracy)', fontsize=11)
-ax2.set_title('(b) Utility Cost', fontsize=12)
-ax2.legend(loc='lower right', fontsize=10)
-
-plt.tight_layout()
-plt.savefig('Figure_1_Revised.png', dpi=300, bbox_inches='tight', facecolor='white')
-plt.close()
-
-# --- Plot Figure 2 ---
-k2_vals = [2, 10]
-gdpr2_auc = [0.520, 0.556]
-gdpr2_err = [0.016, 0.013]
-ai2_auc = [0.734, 0.627, 0.598, 0.577, 0.576]
-ai2_err = [0.016, 0.012, 0.015, 0.017, 0.016]
-base2_auc = 0.573
-
-plt.figure(figsize=(8, 6))
-plt.axhline(base2_auc, color=colors['base'], linestyle='--', linewidth=2, label='Baseline (Depth-restricted)')
-plt.axhline(0.5, color='gray', linestyle=':', linewidth=2, label='Random Guess (No exposure)')
-plt.errorbar(k2_vals, gdpr2_auc, yerr=gdpr2_err, fmt='o', color=colors['gdpr'], markersize=10, capsize=4, label='GDPR-style Generalization (k bins)')
-plt.errorbar(eps_vals, ai2_auc, yerr=ai2_err, fmt='-s', color=colors['ai'], markersize=8, capsize=4, linewidth=2, label='AI Act-style Naive Input Perturbation (ε)')
-plt.title('Figure 2: Data Exposure Risk (Restricted Capacity, max_depth=5)', fontsize=12, fontweight='bold', pad=15)
-plt.xlabel('Mitigation Parameter (k bins or Privacy Budget ε)', fontsize=11)
-plt.ylabel('Membership Inference Attack AUC', fontsize=11)
-plt.legend(loc='lower left', fontsize=10)
-plt.tight_layout()
-plt.savefig('Figure_2_Revised.png', dpi=300, bbox_inches='tight', facecolor='white')
-plt.close()
+if __name__ == "__main__":
+    print("Running MIA Simulation - Baseline (Unrestricted)")
+    auc_scores, util_scores = [], []
+    
+    for seed in range(20):
+        auc, util = run_trial(trial_seed=seed, max_depth=None, mitigation_type=None)
+        auc_scores.append(auc)
+        util_scores.append(util)
+        
+    print(f"Baseline Attack AUC: {np.mean(auc_scores):.3f} +/- {np.std(auc_scores):.3f}")
+    print(f"Baseline Model Utility: {np.mean(util_scores):.3f} +/- {np.std(util_scores):.3f}")
